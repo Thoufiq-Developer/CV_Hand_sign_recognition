@@ -1,3 +1,5 @@
-mediapipe
-opencv-python
-math
+streamlit
+google-generativeai
+pypdf
+python-dotenv
+requests
