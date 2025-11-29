@@ -1,148 +1,146 @@
-import io
-import time
-import math
-import json
-from collections import Counter
-from typing import Tuple
-from PIL import Image
-import numpy as np
-import cv2
 import streamlit as st
+import threading
+import time
+import cv2
+import numpy as np
+from PIL import Image
+import io
 
-st.set_page_config(page_title="Hand Sign Detector (OpenCV)", layout="wide")
+try:
+    import mediapipe as mp
+except Exception:
+    mp = None
 
-def read_image(uploaded_file) -> np.ndarray:
-    data = uploaded_file.read()
-    image = Image.open(io.BytesIO(data)).convert("RGB")
-    return np.array(image)
+st.set_page_config(page_title="Live Hand Sign Recognition", layout="wide")
+st.title("Live Hand Sign Recognition")
 
-def preprocess_hand(img: np.ndarray) -> np.ndarray:
-    img_blur = cv2.GaussianBlur(img, (7, 7), 0)
-    hsv = cv2.cvtColor(img_blur, cv2.COLOR_RGB2HSV)
-    lower = np.array([0, 20, 70])
-    upper = np.array([20, 255, 255])
-    mask1 = cv2.inRange(hsv, lower, upper)
-    lower2 = np.array([170,20,70])
-    upper2 = np.array([180,255,255])
-    mask2 = cv2.inRange(hsv, lower2, upper2)
-    mask = cv2.bitwise_or(mask1, mask2)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    return mask
+if mp is None:
+    st.error("mediapipe is not installed. This app requires mediapipe for live webcam analysis. Install mediapipe and restart the app.")
+    st.stop()
 
-def largest_contour(mask: np.ndarray) -> Tuple[np.ndarray, float]:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None, 0.0
-    c = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(c)
-    return c, area
+mp_hands = mp.solutions.hands
+mp_draw = mp.solutions.drawing_utils
 
-def count_fingers_from_contour(contour: np.ndarray, image: np.ndarray) -> Tuple[int, float, np.ndarray]:
-    hull = cv2.convexHull(contour, returnPoints=False)
-    if hull is None or len(hull) < 3:
-        return 0, 0.0, image
-    defects = cv2.convexityDefects(contour, hull)
-    if defects is None:
-        return 0, 0.0, image
-    h, w = image.shape[:2]
-    finger_count = 0
-    annotated = image.copy()
-    depths = []
-    for i in range(defects.shape[0]):
-        s, e, f, depth = defects[i,0]
-        start = tuple(contour[s][0])
-        end = tuple(contour[e][0])
-        far = tuple(contour[f][0])
-        a = math.dist(start, end)
-        b = math.dist(start, far)
-        c = math.dist(end, far)
-        angle = math.acos(max(0.0, min(1.0, (b*b + c*c - a*a) / (2*b*c + 1e-8)))) * 180 / math.pi
-        if angle < 90 and depth > 1000:
-            finger_count += 1
-            depths.append(depth)
-            cv2.circle(annotated, far, 5, (0,255,0), -1)
-            cv2.line(annotated, start, far, (255,0,0), 2)
-            cv2.line(annotated, end, far, (255,0,0), 2)
-    # fingers = defects + 1 if any defects else 0, but clamp
-    fingers = min(5, finger_count + 1 if finger_count>0 else 0)
-    conf = min(1.0, (sum(depths)/ (len(depths)+1)) / 5000.0) if depths else 0.0
-    return fingers, conf, annotated
+def calc_dist(a, b):
+    return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5
 
-def detect_gesture(fingers: int, conf: float) -> str:
-    if conf < 0.05:
-        return "No hand detected / uncertain"
-    if fingers == 0:
-        return "Fist / No fingers"
-    if fingers == 1:
-        return "One finger"
-    if fingers == 2:
-        return "Two fingers"
-    if fingers == 3:
-        return "Three fingers"
-    if fingers == 4:
-        return "Four fingers"
-    if fingers >= 5:
-        return "Open hand (5+ fingers)"
+def detect_signs(landmarks):
+    try:
+        thumb_tip = landmarks[mp_hands.HandLandmark.THUMB_TIP]
+        thumb_ip = landmarks[mp_hands.HandLandmark.THUMB_IP]
+        index_tip = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+        index_mcp = landmarks[mp_hands.HandLandmark.INDEX_FINGER_MCP]
+        middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+        middle_mcp = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_MCP]
+        ring_tip = landmarks[mp_hands.HandLandmark.RING_FINGER_TIP]
+        ring_mcp = landmarks[mp_hands.HandLandmark.RING_FINGER_MCP]
+        pinky_tip = landmarks[mp_hands.HandLandmark.PINKY_TIP]
+        pinky_mcp = landmarks[mp_hands.HandLandmark.PINKY_MCP]
 
-# UI
-st.markdown("# Hand Sign Detector")
-st.markdown("Upload a clear hand image (good lighting, plain background) and the app will detect number of fingers and a basic gesture label.")
-col_left, col_right = st.columns([2,1])
+        thumb_extended = thumb_tip.x < thumb_ip.x if True else thumb_tip.y < thumb_ip.y
+        fingers_extended = (
+            index_tip.y < index_mcp.y,
+            middle_tip.y < middle_mcp.y,
+            ring_tip.y < ring_mcp.y,
+            pinky_tip.y < pinky_mcp.y
+        )
 
-with col_left:
-    uploaded = st.file_uploader("Upload image (jpg/png)", type=["jpg","jpeg","png"])
-    st.markdown("Or drag & drop an image into this box.")
-    if uploaded:
-        img_np = read_image(uploaded)
-        display_img = img_np.copy()
-        st.image(display_img, caption="Input image", use_column_width=True)
-        mask = preprocess_hand(img_np)
-        contour, area = largest_contour(mask)
-        if contour is None or area < 2000:
-            st.warning("No prominent hand contour found. Try a clearer image or crop background.")
-            detected_label = "No hand"
-            fingers = 0
-            conf = 0.0
-            annotated = display_img
-        else:
-            fingers, conf, annotated = count_fingers_from_contour(contour, display_img)
-            detected_label = detect_gesture(fingers, conf)
-            # draw contour and bbox
-            x,y,w,h = cv2.boundingRect(contour)
-            cv2.rectangle(annotated, (x,y), (x+w, y+h), (0,128,255), 2)
-            cv2.drawContours(annotated, [contour], -1, (0,255,0), 2)
-            st.image(annotated, caption="Annotated result", use_column_width=True)
-        st.success(f"Detected: {detected_label}")
-        st.markdown(f"- Fingers (estimated): **{fingers}**")
-        st.markdown(f"- Confidence (approx): **{conf:.2f}**")
-        # provide downloadable analysis JSON
-        analysis = {
-            "label": detected_label,
-            "fingers_estimated": int(fingers),
-            "confidence": float(conf),
-            "contour_area": float(area)
-        }
-        btn = st.download_button("Download Analysis (JSON)", data=json.dumps(analysis, indent=2), file_name="hand_analysis.json", mime="application/json")
+        if thumb_tip.y > middle_tip.y and calc_dist(middle_tip, ring_tip) > calc_dist(index_tip, middle_tip):
+            return "Vulcan / Fire signal"
+        if all(fingers_extended) and thumb_extended:
+            return "Open Hand / Help"
+        if index_tip.y < thumb_tip.y and middle_tip.y < thumb_tip.y and ring_tip.y < thumb_tip.y and pinky_tip.y < thumb_tip.y:
+            return "Medical Alert"
+        if thumb_extended and (index_tip.y < index_mcp.y):
+            if middle_tip.y > thumb_tip.y and ring_tip.y > thumb_tip.y and pinky_tip.y > thumb_tip.y:
+                return "Brake Fail"
+        return None
+    except Exception:
+        return None
 
-with col_right:
-    st.subheader("Analysis Panel")
-    st.write("This panel summarizes recent uploads.")
-    if "history" not in st.session_state:
-        st.session_state.history = []
-    if uploaded:
-        st.session_state.history.append({
-            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "label": detected_label,
-            "fingers": int(fingers),
-            "confidence": float(conf),
-            "area": float(area)
-        })
-    history = list(reversed(st.session_state.history))[:10]
-    if history:
-        st.table(history)
-    else:
-        st.write("No analyses yet. Upload an image to start.")
+if "running" not in st.session_state:
+    st.session_state.running = False
+if "last_label" not in st.session_state:
+    st.session_state.last_label = "None"
+if "counters" not in st.session_state:
+    st.session_state.counters = {"Vulcan / Fire signal":0,"Open Hand / Help":0,"Medical Alert":0,"Brake Fail":0,"Unknown":0}
+
+col1, col2 = st.columns([3,1])
+with col1:
+    st.header("Live Video")
+    mode = st.radio("Mode", ["Webcam (Live)", "Upload Image"], index=0)
+    video_placeholder = st.empty()
+    start = st.button("Start") if mode=="Webcam (Live)" else None
+    stop = st.button("Stop") if mode=="Webcam (Live)" else None
+
+with col2:
+    st.header("Analysis")
+    st.write("Last detected:")
+    last_box = st.empty()
+    st.write("Counters:")
+    count_box = st.empty()
+    if st.button("Reset Counters"):
+        st.session_state.counters = {k:0 for k in st.session_state.counters}
+        st.session_state.last_label = "None"
+
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1, min_detection_confidence=0.6, min_tracking_confidence=0.5)
+
+def process_frame(frame_bgr):
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    results = hands.process(frame_rgb)
+    label = None
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            mp_draw.draw_landmarks(frame_bgr, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            label = detect_signs(hand_landmarks.landmark)
+            if label is None:
+                label = "Unknown"
+            cv2.putText(frame_bgr, label, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,200,0), 2, cv2.LINE_AA)
+    return frame_bgr, label
+
+def webcam_loop():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        st.error("Unable to open webcam. Make sure camera is free and accessible.")
+        st.session_state.running = False
+        return
+    while st.session_state.running:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.flip(frame, 1)
+        annotated, label = process_frame(frame)
+        if label:
+            st.session_state.last_label = label
+            st.session_state.counters[label] = st.session_state.counters.get(label,0)+1
+        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+        video_placeholder.image(annotated_rgb, channels="RGB")
+        last_box.markdown(f"**{st.session_state.last_label}**")
+        count_box.table(st.session_state.counters)
+        time.sleep(0.03)
+    cap.release()
+
+if mode=="Webcam (Live)":
+    if start and not st.session_state.running:
+        st.session_state.running = True
+        t = threading.Thread(target=webcam_loop, daemon=True)
+        t.start()
+    if stop and st.session_state.running:
+        st.session_state.running = False
+
+if mode=="Upload Image":
+    uploaded = st.file_uploader("Upload image", type=["png","jpg","jpeg"])
+    if uploaded is not None:
+        image = Image.open(uploaded).convert("RGB")
+        frame = np.array(image)[:,:,::-1].copy()
+        annotated, label = process_frame(frame)
+        if label:
+            st.session_state.last_label = label
+            st.session_state.counters[label] = st.session_state.counters.get(label,0)+1
+        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+        video_placeholder.image(annotated_rgb, channels="RGB")
+        last_box.markdown(f"**{st.session_state.last_label}**")
+        count_box.table(st.session_state.counters)
 
 st.markdown("---")
+
