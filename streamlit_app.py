@@ -1,185 +1,148 @@
-import streamlit as st
-import threading
-import time
-import cv2
-import mediapipe as mp
-import numpy as np
-from PIL import Image
 import io
+import time
+import math
+import json
+from collections import Counter
+from typing import Tuple
+from PIL import Image
+import numpy as np
+import cv2
+import streamlit as st
 
-st.set_page_config(page_title="Hand Sign Recognition", layout="wide")
+st.set_page_config(page_title="Hand Sign Detector (OpenCV)", layout="wide")
 
-mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
+def read_image(uploaded_file) -> np.ndarray:
+    data = uploaded_file.read()
+    image = Image.open(io.BytesIO(data)).convert("RGB")
+    return np.array(image)
 
-def calculate_distance(p1, p2):
-    return ((p2.x - p1.x) ** 2 + (p2.y - p1.y) ** 2) ** 0.5
+def preprocess_hand(img: np.ndarray) -> np.ndarray:
+    img_blur = cv2.GaussianBlur(img, (7, 7), 0)
+    hsv = cv2.cvtColor(img_blur, cv2.COLOR_RGB2HSV)
+    lower = np.array([0, 20, 70])
+    upper = np.array([20, 255, 255])
+    mask1 = cv2.inRange(hsv, lower, upper)
+    lower2 = np.array([170,20,70])
+    upper2 = np.array([180,255,255])
+    mask2 = cv2.inRange(hsv, lower2, upper2)
+    mask = cv2.bitwise_or(mask1, mask2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    return mask
 
-def is_violence_at_home_hand(landmarks):
-    thumb_tip = landmarks[mp_hands.HandLandmark.THUMB_TIP]
-    index_tip = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-    middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-    ring_tip = landmarks[mp_hands.HandLandmark.RING_FINGER_TIP]
-    pinky_tip = landmarks[mp_hands.HandLandmark.PINKY_TIP]
-    thumb_extended = thumb_tip.y < landmarks[mp_hands.HandLandmark.THUMB_IP].y
-    fingers_extended = (
-        index_tip.y < landmarks[mp_hands.HandLandmark.INDEX_FINGER_MCP].y and
-        middle_tip.y < landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_MCP].y and
-        ring_tip.y < landmarks[mp_hands.HandLandmark.RING_FINGER_MCP].y and
-        pinky_tip.y < landmarks[mp_hands.HandLandmark.PINKY_MCP].y
-    )
-    return thumb_extended and fingers_extended
+def largest_contour(mask: np.ndarray) -> Tuple[np.ndarray, float]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, 0.0
+    c = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(c)
+    return c, area
 
-def is_hand_open(landmarks):
-    thumb_tip = landmarks[mp_hands.HandLandmark.THUMB_TIP]
-    index_tip = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-    middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-    distance_thumb_index = calculate_distance(thumb_tip, index_tip)
-    distance_thumb_middle = calculate_distance(thumb_tip, middle_tip)
-    return distance_thumb_index > 0.10 and distance_thumb_middle > 0.10
+def count_fingers_from_contour(contour: np.ndarray, image: np.ndarray) -> Tuple[int, float, np.ndarray]:
+    hull = cv2.convexHull(contour, returnPoints=False)
+    if hull is None or len(hull) < 3:
+        return 0, 0.0, image
+    defects = cv2.convexityDefects(contour, hull)
+    if defects is None:
+        return 0, 0.0, image
+    h, w = image.shape[:2]
+    finger_count = 0
+    annotated = image.copy()
+    depths = []
+    for i in range(defects.shape[0]):
+        s, e, f, depth = defects[i,0]
+        start = tuple(contour[s][0])
+        end = tuple(contour[e][0])
+        far = tuple(contour[f][0])
+        a = math.dist(start, end)
+        b = math.dist(start, far)
+        c = math.dist(end, far)
+        angle = math.acos(max(0.0, min(1.0, (b*b + c*c - a*a) / (2*b*c + 1e-8)))) * 180 / math.pi
+        if angle < 90 and depth > 1000:
+            finger_count += 1
+            depths.append(depth)
+            cv2.circle(annotated, far, 5, (0,255,0), -1)
+            cv2.line(annotated, start, far, (255,0,0), 2)
+            cv2.line(annotated, end, far, (255,0,0), 2)
+    # fingers = defects + 1 if any defects else 0, but clamp
+    fingers = min(5, finger_count + 1 if finger_count>0 else 0)
+    conf = min(1.0, (sum(depths)/ (len(depths)+1)) / 5000.0) if depths else 0.0
+    return fingers, conf, annotated
 
-def fire_alert(landmarks):
-    thumb_tip = landmarks[mp_hands.HandLandmark.THUMB_TIP]
-    index_tip = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-    middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-    ring_tip = landmarks[mp_hands.HandLandmark.RING_FINGER_TIP]
-    hand_size = calculate_distance(landmarks[0], middle_tip)
-    distance_middle_ring = calculate_distance(middle_tip, ring_tip)
-    distance_index_middle = calculate_distance(index_tip, middle_tip)
-    vulcan_salute = (thumb_tip.y > middle_tip.y and distance_middle_ring > distance_index_middle)
-    return vulcan_salute
+def detect_gesture(fingers: int, conf: float) -> str:
+    if conf < 0.05:
+        return "No hand detected / uncertain"
+    if fingers == 0:
+        return "Fist / No fingers"
+    if fingers == 1:
+        return "One finger"
+    if fingers == 2:
+        return "Two fingers"
+    if fingers == 3:
+        return "Three fingers"
+    if fingers == 4:
+        return "Four fingers"
+    if fingers >= 5:
+        return "Open hand (5+ fingers)"
 
-def medical_alert(landmarks):
-    thumb_tip = landmarks[mp_hands.HandLandmark.THUMB_TIP]
-    index_tip = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-    middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-    ring_tip = landmarks[mp_hands.HandLandmark.RING_FINGER_TIP]
-    pinky_tip = landmarks[mp_hands.HandLandmark.PINKY_TIP]
-    return (index_tip.y < thumb_tip.y and middle_tip.y < thumb_tip.y and
-            ring_tip.y < thumb_tip.y and pinky_tip.y < thumb_tip.y)
+# UI
+st.markdown("# Hand Sign Detector")
+st.markdown("Upload a clear hand image (good lighting, plain background) and the app will detect number of fingers and a basic gesture label.")
+col_left, col_right = st.columns([2,1])
 
-def brake_fail(landmarks):
-    thumb_tip = landmarks[mp_hands.HandLandmark.THUMB_TIP]
-    index_tip = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-    middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-    ring_tip = landmarks[mp_hands.HandLandmark.RING_FINGER_TIP]
-    pinky_tip = landmarks[mp_hands.HandLandmark.PINKY_TIP]
-    thumb_extended = thumb_tip.y < landmarks[mp_hands.HandLandmark.THUMB_IP].y
-    index_extended = index_tip.y < landmarks[mp_hands.HandLandmark.INDEX_FINGER_MCP].y
-    mrp_curled = (middle_tip.y > thumb_tip.y and middle_tip.y > index_tip.y and
-                  pinky_tip.y > thumb_tip.y and pinky_tip.y > index_tip.y and
-                  ring_tip.y > thumb_tip.y and ring_tip.y > index_tip.y)
-    return thumb_extended and index_extended and mrp_curled
-
-def detect_signs_from_landmarks(landmarks):
-    try:
-        if fire_alert(landmarks):
-            return "Fire Signal"
-        if is_violence_at_home_hand(landmarks):
-            return "Help / Violence Signal"
-        if is_hand_open(landmarks):
-            return "Open Hand / Help"
-        if medical_alert(landmarks):
-            return "Medical Alert"
-        if brake_fail(landmarks):
-            return "Brake Fail"
-    except Exception:
-        return None
-    return None
-
-# UI layout
-st.title("Hand Sign Recognition")
-st.markdown("Live webcam and single-image detection. Analysis panel shows last detected label and counters.")
-
-col1, col2 = st.columns([2, 1])
-with col1:
-    mode = st.radio("Mode", ["Webcam (live)", "Upload image"], index=0)
-    img_placeholder = st.empty()
-    start_button = st.button("Start Webcam") if mode == "Webcam (live)" else None
-    stop_button = st.button("Stop Webcam") if mode == "Webcam (live)" else None
-
-with col2:
-    st.subheader("Analysis")
-    last_label = st.empty()
-    counts_area = st.empty()
-    reset_counts = st.button("Reset counters")
-
-# session state for background thread and counters
-if "running" not in st.session_state:
-    st.session_state.running = False
-if "counters" not in st.session_state:
-    st.session_state.counters = {"Fire Signal": 0, "Help / Violence Signal": 0, "Open Hand / Help": 0, "Medical Alert": 0, "Brake Fail": 0, "Unknown": 0}
-if "last" not in st.session_state:
-    st.session_state.last = "None"
-
-if reset_counts:
-    st.session_state.counters = {k: 0 for k in st.session_state.counters}
-    st.session_state.last = "None"
-
-hands_proc = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.6, min_tracking_confidence=0.5)
-
-def process_frame(frame_bgr):
-    img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    results = hands_proc.process(img_rgb)
-    label = None
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            landmarks = hand_landmarks.landmark
-            label = detect_signs_from_landmarks(landmarks)
-            mp_draw.draw_landmarks(frame_bgr, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-            if label:
-                cv2.putText(frame_bgr, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (10, 200, 10), 2)
-    return frame_bgr, label
-
-# Webcam thread
-def webcam_thread():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        st.session_state.running = False
-        return
-    while st.session_state.running:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv2.flip(frame, 1)
-        annotated, label = process_frame(frame)
-        if label:
-            st.session_state.last = label
-            st.session_state.counters[label] = st.session_state.counters.get(label, 0) + 1
-        # convert BGR->RGB for display
-        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-        img_placeholder.image(annotated_rgb, channels="RGB")
-        last_label.markdown(f"**Last detected:** {st.session_state.last}")
-        counts_area.table(st.session_state.counters)
-        time.sleep(0.03)
-    cap.release()
-
-# Start / stop control
-if mode == "Webcam (live)":
-    if start_button and not st.session_state.running:
-        st.session_state.running = True
-        t = threading.Thread(target=webcam_thread, daemon=True)
-        t.start()
-    if stop_button and st.session_state.running:
-        st.session_state.running = False
-
-# Upload image mode
-if mode == "Upload image":
-    uploaded_file = st.file_uploader("Choose an image", type=["png","jpg","jpeg"])
-    if uploaded_file is not None:
-        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-        frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        if frame is None:
-            st.error("Cannot read image")
+with col_left:
+    uploaded = st.file_uploader("Upload image (jpg/png)", type=["jpg","jpeg","png"])
+    st.markdown("Or drag & drop an image into this box.")
+    if uploaded:
+        img_np = read_image(uploaded)
+        display_img = img_np.copy()
+        st.image(display_img, caption="Input image", use_column_width=True)
+        mask = preprocess_hand(img_np)
+        contour, area = largest_contour(mask)
+        if contour is None or area < 2000:
+            st.warning("No prominent hand contour found. Try a clearer image or crop background.")
+            detected_label = "No hand"
+            fingers = 0
+            conf = 0.0
+            annotated = display_img
         else:
-            annotated, label = process_frame(frame.copy())
-            annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-            img_placeholder.image(annotated_rgb, channels="RGB")
-            if label:
-                st.session_state.last = label
-                st.session_state.counters[label] = st.session_state.counters.get(label, 0) + 1
-            last_label.markdown(f"**Last detected:** {st.session_state.last}")
-            counts_area.table(st.session_state.counters)
+            fingers, conf, annotated = count_fingers_from_contour(contour, display_img)
+            detected_label = detect_gesture(fingers, conf)
+            # draw contour and bbox
+            x,y,w,h = cv2.boundingRect(contour)
+            cv2.rectangle(annotated, (x,y), (x+w, y+h), (0,128,255), 2)
+            cv2.drawContours(annotated, [contour], -1, (0,255,0), 2)
+            st.image(annotated, caption="Annotated result", use_column_width=True)
+        st.success(f"Detected: {detected_label}")
+        st.markdown(f"- Fingers (estimated): **{fingers}**")
+        st.markdown(f"- Confidence (approx): **{conf:.2f}**")
+        # provide downloadable analysis JSON
+        analysis = {
+            "label": detected_label,
+            "fingers_estimated": int(fingers),
+            "confidence": float(conf),
+            "contour_area": float(area)
+        }
+        btn = st.download_button("Download Analysis (JSON)", data=json.dumps(analysis, indent=2), file_name="hand_analysis.json", mime="application/json")
+
+with col_right:
+    st.subheader("Analysis Panel")
+    st.write("This panel summarizes recent uploads.")
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    if uploaded:
+        st.session_state.history.append({
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "label": detected_label,
+            "fingers": int(fingers),
+            "confidence": float(conf),
+            "area": float(area)
+        })
+    history = list(reversed(st.session_state.history))[:10]
+    if history:
+        st.table(history)
+    else:
+        st.write("No analyses yet. Upload an image to start.")
 
 st.markdown("---")
-st.caption("Notes: Camera access works when running locally. On hosted platforms the webcam may not be accessible. Use the upload mode for testing images.")
