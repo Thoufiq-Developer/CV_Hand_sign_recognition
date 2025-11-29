@@ -1,5 +1,5 @@
 streamlit
-google-generativeai
-pypdf
-python-dotenv
-requests
+opencv-python
+mediapipe
+numpy
+Pillow
